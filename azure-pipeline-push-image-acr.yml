@@ -1,0 +1,36 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+
+- checkout: self
+  clean: true
+
+- task: Docker@2
+  displayName: 'Build y Push de imagen a ACR'
+  inputs:
+    command: 'buildAndPush'
+    containerRegistry: '$(dockerRegistryServiceConnection)'
+    repository: '$(imageRepository)'
+    Dockerfile: '$(Build.SourcesDirectory)/docker/Dockerfile'
+    buildContext: '$(Build.SourcesDirectory)/docker'
+    tags: |
+      $(Build.BuildId)
+      latest
+
+- bash: |
+    echo '============================================================'
+    echo ' BUILD Y PUSH FINALIZADO CORRECTAMENTE'
+    echo '============================================================'
+    echo "Repositorio : $(imageRepository)"
+    echo "Build ID    : $(Build.BuildId)"
+    echo "Tags        : $(Build.BuildId), latest"
+    echo '============================================================'
+  displayName: 'Resumen de imagen publicada'

@@ -1,0 +1,884 @@
+# No ejecutar directamente por cambios en este repositorio.
+trigger: none
+
+# No ejecutar automáticamente por Pull Requests.
+pr: none
+
+# ============================================================
+# PIPELINE RESOURCE
+# Ejecuta este pipeline de VM cuando el pipeline Build + Push
+# termina correctamente para la rama main.
+# ============================================================
+resources:
+  pipelines:
+  - pipeline: containerBuild
+    source: 
+    trigger:
+      branches:
+        include:
+        - main
+
+# ============================================================
+# CONFIGURACIÓN
+# Las variables se administran en Azure DevOps:
+# Pipeline > Edit > Variables
+#
+# Solo se parametrizan valores propios del ambiente/aplicación.
+# Los valores operativos (reintentos, esperas y timeouts internos)
+# quedan definidos en el YAML para mantener el ejercicio simple.
+# En propiedades YAML se utiliza: $(variableName)
+# Dentro de Bash se utilizan variables de entorno: ${VARIABLE_NAME}
+# ============================================================
+
+stages:
+
+# ============================================================
+# STAGE 0 - VALIDACIÓN DE VARIABLES
+# Valida que las variables requeridas existan y estén cargadas
+# antes de intentar acceder a Azure o desplegar en la VM.
+# ============================================================
+- stage: ValidateVariables
+  displayName: 'Validar variables del pipeline'
+
+  jobs:
+  - job: ValidateVariables
+    displayName: 'Comprobar configuración requerida'
+
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - checkout: none
+
+    - bash: |
+        set -Eeuo pipefail
+
+        echo
+        echo '============================================================'
+        echo ' VALIDANDO VARIABLES REQUERIDAS'
+        echo '============================================================'
+        echo
+
+        REQUIRED_VARS=(
+          AZURE_SERVICE_CONNECTION
+          ENVIRONMENT_NAME
+          RESOURCE_GROUP_NAME
+          VIRTUAL_MACHINE_NAME
+          ACR_NAME
+          ACR_LOGIN_SERVER
+          IMAGE_REPOSITORY
+          IMAGE_TAG
+          CONTAINER_NAME
+          HOST_PORT
+          CONTAINER_PORT
+          VM_USER
+        )
+
+        ERROR_FOUND='false'
+
+        for VAR_NAME in "${REQUIRED_VARS[@]}"; do
+          VAR_VALUE="${!VAR_NAME:-}"
+
+          if [[ -z "${VAR_VALUE}" ]]; then
+            echo "ERROR: ${VAR_NAME} no tiene valor."
+            ERROR_FOUND='true'
+          elif [[ "${VAR_VALUE}" =~ ^\$\(.+\)$ ]]; then
+            echo "ERROR: ${VAR_NAME} no está definida en Azure DevOps."
+            ERROR_FOUND='true'
+          else
+            echo "OK: ${VAR_NAME}"
+          fi
+        done
+
+        echo
+
+        if [[ "${ERROR_FOUND}" == 'true' ]]; then
+          echo '============================================================'
+          echo ' ERROR: FALTAN VARIABLES REQUERIDAS'
+          echo ' Revise: Pipeline > Edit > Variables'
+          echo '============================================================'
+          exit 1
+        fi
+
+        echo '============================================================'
+        echo ' OK: TODAS LAS VARIABLES REQUERIDAS ESTÁN CONFIGURADAS'
+        echo '============================================================'
+
+      displayName: 'Validar variables requeridas'
+      env:
+        AZURE_SERVICE_CONNECTION: $(azureServiceConnection)
+        ENVIRONMENT_NAME: $(environmentName)
+        RESOURCE_GROUP_NAME: $(resourceGroupName)
+        VIRTUAL_MACHINE_NAME: $(virtualMachineName)
+        ACR_NAME: $(acrName)
+        ACR_LOGIN_SERVER: $(acrLoginServer)
+        IMAGE_REPOSITORY: $(imageRepository)
+        IMAGE_TAG: $(imageTag)
+        CONTAINER_NAME: $(containerName)
+        HOST_PORT: $(hostPort)
+        CONTAINER_PORT: $(containerPort)
+        VM_USER: $(vmUser)
+
+# ============================================================
+# STAGE 1 - BOOTSTRAP
+# Se ejecuta desde un Microsoft-hosted agent y prepara la VM
+# mediante Azure VM Run Command, evitando sudo interactivo.
+# ============================================================
+- stage: Bootstrap
+  displayName: 'Preparar VM para contenedores'
+  dependsOn: ValidateVariables
+  condition: succeeded()
+
+  jobs:
+  - job: PrepareVM
+    displayName: 'Instalar y configurar Docker y Azure CLI'
+
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    # Azure DevOps exige entero literal en timeoutInMinutes; no acepta variables UI aquí.
+    timeoutInMinutes: 25
+
+    steps:
+    - checkout: none
+
+    - task: AzureCLI@2
+      displayName: 'Bootstrap automatizado de la VM'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -Eeuo pipefail
+
+          echo
+          echo '============================================================'
+          echo ' [1/4] VALIDANDO MÁQUINA VIRTUAL'
+          echo '============================================================'
+          echo
+
+          az vm show \
+            --resource-group "${RESOURCE_GROUP_NAME}" \
+            --name "${VIRTUAL_MACHINE_NAME}" \
+            --query "{VM:name,Region:location,Size:hardwareProfile.vmSize,Provisioning:provisioningState}" \
+            --output table
+
+          VM_POWER_STATE=$(az vm get-instance-view \
+            --resource-group "${RESOURCE_GROUP_NAME}" \
+            --name "${VIRTUAL_MACHINE_NAME}" \
+            --query "instanceView.statuses[?starts_with(code,'PowerState/')].code | [0]" \
+            --output tsv)
+
+          echo
+          echo "Estado actual: ${VM_POWER_STATE}"
+
+          if [[ "${VM_POWER_STATE}" != 'PowerState/running' ]]; then
+            echo 'La VM no está en ejecución. Iniciando...'
+            az vm start \
+              --resource-group "${RESOURCE_GROUP_NAME}" \
+              --name "${VIRTUAL_MACHINE_NAME}" \
+              --output none
+          fi
+
+          echo
+          echo '============================================================'
+          echo ' [2/4] GENERANDO BOOTSTRAP REMOTO'
+          echo '============================================================'
+          echo
+
+          # El primer heredoc inserta las variables de entorno en el script remoto.
+          # El segundo heredoc se mantiene literal para que las variables $VAR sean
+          # evaluadas dentro de la VM y no en el agente Microsoft-hosted.
+          BOOTSTRAP_SCRIPT=$(
+            cat <<REMOTE_ENV
+          VM_USER='${VM_USER}'
+          DOCKER_GROUP_NAME='docker'
+          DOCKER_SERVICE_NAME='docker'
+          APACHE_SERVICE_NAME='apache2'
+          HOST_PORT='${HOST_PORT}'
+          APT_LOCK_MAX_ATTEMPTS='36'
+          APT_LOCK_WAIT_SECONDS='5'
+          AZURE_CLI_PREVIEW_LINES='5'
+          AGENT_SERVICE_RESTART_WAIT_SECONDS='5'
+          REMOTE_ENV
+
+            cat <<'REMOTE_SCRIPT'
+          set -eu
+
+          export DEBIAN_FRONTEND=noninteractive
+
+          wait_for_apt() {
+            attempt=1
+
+            while [ "$attempt" -le "$APT_LOCK_MAX_ATTEMPTS" ]; do
+              if command -v fuser >/dev/null 2>&1; then
+                if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+                  && ! fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
+                  && ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+                  return 0
+                fi
+              else
+                return 0
+              fi
+
+              echo "APT/DPKG ocupado. Esperando... intento ${attempt}/${APT_LOCK_MAX_ATTEMPTS}"
+              attempt=$((attempt + 1))
+              sleep "$APT_LOCK_WAIT_SECONDS"
+            done
+
+            echo 'ERROR: APT/DPKG continuó bloqueado después del tiempo máximo configurado.'
+            exit 1
+          }
+
+          echo
+          echo '------------------------------------------------------------'
+          echo ' INFORMACIÓN DEL SISTEMA'
+          echo '------------------------------------------------------------'
+          hostname
+          echo
+          cat /etc/os-release
+
+          echo
+          echo '------------------------------------------------------------'
+          echo ' PREPARANDO APT'
+          echo '------------------------------------------------------------'
+          wait_for_apt
+          apt-get update
+
+          echo
+          echo '------------------------------------------------------------'
+          echo ' INSTALANDO DEPENDENCIAS'
+          echo '------------------------------------------------------------'
+          apt-get install -y ca-certificates curl gnupg
+
+          echo
+          echo '------------------------------------------------------------'
+          echo ' INSTALANDO / VALIDANDO DOCKER'
+          echo '------------------------------------------------------------'
+
+          if ! command -v docker >/dev/null 2>&1; then
+            install -m 0755 -d /etc/apt/keyrings
+
+            curl -fsSL \
+              https://download.docker.com/linux/ubuntu/gpg \
+              -o /tmp/docker-archive-keyring.gpg
+
+            gpg --dearmor \
+              -o /etc/apt/keyrings/docker.gpg \
+              /tmp/docker-archive-keyring.gpg
+
+            rm -f /tmp/docker-archive-keyring.gpg
+            chmod a+r /etc/apt/keyrings/docker.gpg
+
+            . /etc/os-release
+
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
+              > /etc/apt/sources.list.d/docker.list
+
+            wait_for_apt
+            apt-get update
+            apt-get install -y \
+              docker-ce \
+              docker-ce-cli \
+              containerd.io \
+              docker-buildx-plugin \
+              docker-compose-plugin
+          else
+            echo 'Docker ya está instalado.'
+          fi
+
+          systemctl enable --now "$DOCKER_SERVICE_NAME"
+
+          if ! systemctl is-active --quiet "$DOCKER_SERVICE_NAME"; then
+            echo 'ERROR: Docker no quedó activo.'
+            exit 1
+          fi
+
+          docker --version
+
+          echo
+          echo '------------------------------------------------------------'
+          echo ' CONFIGURANDO USUARIO PARA DOCKER'
+          echo '------------------------------------------------------------'
+
+          if ! id "$VM_USER" >/dev/null 2>&1; then
+            echo "ERROR: No existe el usuario ${VM_USER}."
+            exit 1
+          fi
+
+          groupadd -f "$DOCKER_GROUP_NAME"
+          usermod -aG "$DOCKER_GROUP_NAME" "$VM_USER"
+
+          echo "Grupos configurados para ${VM_USER}:"
+          id "$VM_USER"
+
+          echo
+          echo '------------------------------------------------------------'
+          echo ' INSTALANDO / VALIDANDO AZURE CLI'
+          echo '------------------------------------------------------------'
+
+          if ! command -v az >/dev/null 2>&1; then
+            curl -fsSL \
+              https://aka.ms/InstallAzureCLIDeb \
+              -o /tmp/install-azure-cli.sh
+
+            bash /tmp/install-azure-cli.sh
+            rm -f /tmp/install-azure-cli.sh
+          else
+            echo 'Azure CLI ya está instalada.'
+          fi
+
+          az --version | head -n "$AZURE_CLI_PREVIEW_LINES"
+
+          echo
+          echo '------------------------------------------------------------'
+          echo " LIBERANDO TCP/${HOST_PORT}"
+          echo '------------------------------------------------------------'
+
+          if systemctl list-unit-files --no-legend 2>/dev/null \
+            | grep -q "^${APACHE_SERVICE_NAME}.service"; then
+
+            if systemctl is-active --quiet "$APACHE_SERVICE_NAME"; then
+              echo "${APACHE_SERVICE_NAME} está activo. Deteniendo servicio..."
+              systemctl stop "$APACHE_SERVICE_NAME"
+            fi
+
+            systemctl disable "$APACHE_SERVICE_NAME" >/dev/null 2>&1 || true
+          else
+            echo "${APACHE_SERVICE_NAME} no está instalado."
+          fi
+
+          echo "Procesos escuchando en TCP/${HOST_PORT} antes del deploy:"
+          ss -lntp | grep ":${HOST_PORT} " || true
+
+          echo
+          echo '------------------------------------------------------------'
+          echo ' REINICIANDO AGENTE AZURE DEVOPS'
+          echo '------------------------------------------------------------'
+
+          AGENT_SERVICE=$(systemctl list-unit-files \
+            --type=service \
+            --no-legend 2>/dev/null \
+            | awk '/^vsts\.agent\..*\.service/ {print $1; exit}')
+
+          if [ -z "$AGENT_SERVICE" ]; then
+            AGENT_SERVICE=$(systemctl list-units \
+              --all \
+              --type=service \
+              --no-legend 2>/dev/null \
+              | awk '/vsts\.agent\..*\.service/ {print $1; exit}')
+          fi
+
+          if [ -z "$AGENT_SERVICE" ]; then
+            echo 'ERROR: No se encontró el servicio del agente Azure DevOps.'
+            exit 1
+          fi
+
+          echo "Agente encontrado: ${AGENT_SERVICE}"
+          systemctl restart "$AGENT_SERVICE"
+          sleep "$AGENT_SERVICE_RESTART_WAIT_SECONDS"
+
+          if ! systemctl is-active --quiet "$AGENT_SERVICE"; then
+            echo 'ERROR: El agente Azure DevOps no quedó activo.'
+            systemctl status "$AGENT_SERVICE" --no-pager --lines=20 || true
+            exit 1
+          fi
+
+          echo "Estado del agente: $(systemctl is-active "$AGENT_SERVICE")"
+
+          echo
+          echo '------------------------------------------------------------'
+          echo ' VALIDACIÓN FINAL DEL BOOTSTRAP'
+          echo '------------------------------------------------------------'
+          docker --version
+          az --version | head -n "$AZURE_CLI_PREVIEW_LINES"
+          id "$VM_USER"
+          systemctl is-active "$DOCKER_SERVICE_NAME"
+          systemctl is-active "$AGENT_SERVICE"
+
+          echo
+          echo '__BOOTSTRAP_OK__'
+          REMOTE_SCRIPT
+          )
+
+          echo
+          echo '============================================================'
+          echo ' [3/4] EJECUTANDO BOOTSTRAP EN LA VM'
+          echo '============================================================'
+          echo
+
+          RUN_MESSAGE=$(az vm run-command invoke \
+            --resource-group "${RESOURCE_GROUP_NAME}" \
+            --name "${VIRTUAL_MACHINE_NAME}" \
+            --command-id RunShellScript \
+            --scripts "${BOOTSTRAP_SCRIPT}" \
+            --query 'value[].message' \
+            --output tsv)
+
+          printf '%s\n' "${RUN_MESSAGE}"
+
+          if ! printf '%s\n' "${RUN_MESSAGE}" | grep -q '__BOOTSTRAP_OK__'; then
+            echo
+            echo 'ERROR: El bootstrap remoto no llegó al marcador de finalización.'
+            exit 1
+          fi
+
+          echo
+          echo '============================================================'
+          echo ' [4/4] BOOTSTRAP VALIDADO CORRECTAMENTE'
+          echo '============================================================'
+          echo
+
+          # Dar tiempo al agente self-hosted para volver a registrarse.
+          sleep 10
+
+      env:
+        RESOURCE_GROUP_NAME: $(resourceGroupName)
+        VIRTUAL_MACHINE_NAME: $(virtualMachineName)
+        VM_USER: $(vmUser)
+        HOST_PORT: $(hostPort)
+
+# ============================================================
+# STAGE 2 - DEPLOY
+# Se ejecuta sobre la VM registrada en Azure DevOps Environment.
+# ============================================================
+- stage: Deploy
+  displayName: 'Desplegar contenedor en VM'
+  dependsOn: Bootstrap
+  condition: succeeded()
+
+  jobs:
+  - deployment: DeployToVM
+    displayName: 'Desplegar imagen desde Azure Container Registry'
+    # Azure DevOps exige entero literal en timeoutInMinutes; no acepta variables UI aquí.
+    timeoutInMinutes: 20
+
+    environment:
+      name: '$(environmentName)'
+      resourceType: VirtualMachine
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: none
+
+          - bash: |
+              set -Eeuo pipefail
+
+              echo
+              echo '============================================================'
+              echo ' VALIDANDO VM DE DESPLIEGUE'
+              echo '============================================================'
+              echo
+
+              echo 'Usuario:'
+              whoami
+
+              echo
+              echo 'Hostname:'
+              hostname
+
+              echo
+              echo 'Identidad y grupos:'
+              id
+
+              echo
+              echo '============================================================'
+              echo ' VALIDANDO ACCESO A DOCKER'
+              echo '============================================================'
+              echo
+
+              if ! id -nG | grep -qw "docker"; then
+                echo "ERROR: El agente no heredó la pertenencia al grupo docker."
+                echo "Grupos actuales: $(id -nG)"
+                exit 1
+              fi
+
+              docker --version
+
+              if ! docker ps >/dev/null 2>&1; then
+                echo "ERROR: ${VM_USER} pertenece al grupo docker, pero no puede acceder al daemon."
+                ls -l /var/run/docker.sock || true
+                exit 1
+              fi
+
+              echo 'OK: acceso al daemon Docker validado.'
+
+              echo
+              echo '============================================================'
+              echo ' VALIDANDO AZURE CLI'
+              echo '============================================================'
+              echo
+
+              az --version | head -n "5"
+
+              echo
+              echo '============================================================'
+              echo ' PRERREQUISITOS CORRECTOS'
+              echo '============================================================'
+              echo
+
+            displayName: 'Validar Docker y Azure CLI'
+            env:
+              VM_USER: $(vmUser)
+            
+          - task: AzureCLI@2
+            displayName: 'Pull desde ACR y ejecutar contenedor'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -Eeuo pipefail
+
+                # Valores operativos del ejercicio (fijos para simplificar).
+                DOCKER_RESTART_POLICY='unless-stopped'
+                DOCKER_STOP_TIMEOUT_SECONDS='15'
+                HEALTH_CHECK_HOST='127.0.0.1'
+                HEALTH_CHECK_RETRIES='12'
+                HEALTH_CHECK_INTERVAL_SECONDS='2'
+                ROLLBACK_HEALTH_CHECK_RETRIES='10'
+                ROLLBACK_HEALTH_CHECK_INTERVAL_SECONDS='2'
+                DOCKER_LOG_TAIL_LINES='50'
+                HTTP_RESPONSE_PREVIEW_LINES='20'
+
+                cleanup() {
+                  docker logout "${ACR_LOGIN_SERVER}" >/dev/null 2>&1 || true
+                  unset ACR_PASSWORD ACR_USERNAME || true
+                }
+                trap cleanup EXIT
+
+                echo
+                echo '============================================================'
+                echo ' [1/7] VALIDANDO AZURE CONTAINER REGISTRY'
+                echo '============================================================'
+                echo
+
+                az acr show \
+                  --name "${ACR_NAME}" \
+                  --resource-group "${RESOURCE_GROUP_NAME}" \
+                  --query "{Registry:name,LoginServer:loginServer,Region:location,SKU:sku.name,AdminUser:adminUserEnabled,Estado:provisioningState}" \
+                  --output table
+
+                ADMIN_ENABLED=$(az acr show \
+                  --name "${ACR_NAME}" \
+                  --resource-group "${RESOURCE_GROUP_NAME}" \
+                  --query 'adminUserEnabled' \
+                  --output tsv)
+
+                if [[ "${ADMIN_ENABLED}" != 'true' ]]; then
+                  echo 'ERROR: El Admin User del ACR no está habilitado para este flujo académico.'
+                  exit 1
+                fi
+
+                echo
+                echo '============================================================'
+                echo ' [2/7] VALIDANDO REPOSITORIO Y TAG'
+                echo '============================================================'
+                echo
+
+                az acr repository show \
+                  --name "${ACR_NAME}" \
+                  --repository "${IMAGE_REPOSITORY}" \
+                  --output table
+
+                echo
+                echo 'Tags disponibles:'
+                az acr repository show-tags \
+                  --name "${ACR_NAME}" \
+                  --repository "${IMAGE_REPOSITORY}" \
+                  --orderby time_desc \
+                  --output table
+
+                TAG_EXISTS=$(az acr repository show-tags \
+                  --name "${ACR_NAME}" \
+                  --repository "${IMAGE_REPOSITORY}" \
+                  --query "[?@=='${IMAGE_TAG}'] | length(@)" \
+                  --output tsv)
+
+                if [[ "${TAG_EXISTS}" == '0' ]]; then
+                  echo "ERROR: No existe el tag ${IMAGE_TAG} en ${IMAGE_REPOSITORY}."
+                  exit 1
+                fi
+
+                echo
+                echo '============================================================'
+                echo ' [3/7] AUTENTICANDO DOCKER EN ACR'
+                echo '============================================================'
+                echo
+
+                ACR_USERNAME=$(az acr credential show \
+                  --name "${ACR_NAME}" \
+                  --query 'username' \
+                  --output tsv)
+
+                ACR_PASSWORD=$(az acr credential show \
+                  --name "${ACR_NAME}" \
+                  --query 'passwords[0].value' \
+                  --output tsv)
+
+                if [[ -z "${ACR_USERNAME}" || -z "${ACR_PASSWORD}" ]]; then
+                  echo 'ERROR: No fue posible obtener las credenciales del ACR.'
+                  exit 1
+                fi
+
+                echo "##vso[task.setsecret]${ACR_PASSWORD}"
+
+                printf '%s' "${ACR_PASSWORD}" \
+                  | docker login "${ACR_LOGIN_SERVER}" \
+                      --username "${ACR_USERNAME}" \
+                      --password-stdin
+
+                echo
+                echo '============================================================'
+                echo ' [4/7] DESCARGANDO IMAGEN'
+                echo '============================================================'
+                echo
+
+                IMAGE="${ACR_LOGIN_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+                echo "Imagen a desplegar: ${IMAGE}"
+
+                # IMPORTANTE: primero descargamos la imagen nueva.
+                # Si el pull falla, el contenedor actual continúa ejecutándose.
+                docker pull "${IMAGE}"
+
+                echo
+                echo '============================================================'
+                echo ' [5/7] PREPARANDO DESPLIEGUE'
+                echo '============================================================'
+                echo
+
+                HEALTHCHECK_URL="http://${HEALTH_CHECK_HOST}:${HOST_PORT}/"
+                PORT_MAPPING="${HOST_PORT}:${CONTAINER_PORT}"
+                OLD_IMAGE_ID=''
+
+                echo "Contenedor: ${CONTAINER_NAME}"
+                echo "Health check: ${HEALTHCHECK_URL}"
+                echo "Mapeo configurado: ${PORT_MAPPING}"
+
+                # ----------------------------------------------------------
+                # 1. DETENER EL CONTENEDOR ANTERIOR SI EXISTE
+                # ----------------------------------------------------------
+                if docker ps -a --format '{{.Names}}' | grep -Fxq "${CONTAINER_NAME}"; then
+                  CURRENT_STATUS=$(docker inspect \
+                    --format '{{.State.Status}}' \
+                    "${CONTAINER_NAME}")
+
+                  OLD_IMAGE_ID=$(docker inspect \
+                    --format '{{.Image}}' \
+                    "${CONTAINER_NAME}")
+
+                  echo "Contenedor anterior encontrado: ${CONTAINER_NAME}"
+                  echo "Estado actual: ${CURRENT_STATUS}"
+                  echo "Imagen anterior para rollback: ${OLD_IMAGE_ID}"
+
+                  if docker ps --format '{{.Names}}' | grep -Fxq "${CONTAINER_NAME}"; then
+                    echo 'Deteniendo contenedor anterior...'
+                    docker stop \
+                      --time "${DOCKER_STOP_TIMEOUT_SECONDS}" \
+                      "${CONTAINER_NAME}"
+                  else
+                    echo 'El contenedor anterior ya está detenido.'
+                  fi
+                else
+                  echo "No existe un contenedor anterior llamado ${CONTAINER_NAME}."
+                fi
+
+                # ----------------------------------------------------------
+                # 2. ELIMINAR TODOS LOS CONTENEDORES EN ESTADO EXITED
+                # ----------------------------------------------------------
+                echo
+                echo 'Eliminando contenedores en estado Exited...'
+
+                mapfile -t EXITED_CONTAINERS < <(
+                  docker ps -aq --filter status=exited
+                )
+
+                if (( ${#EXITED_CONTAINERS[@]} > 0 )); then
+                  printf 'Contenedores Exited encontrados: %s\n' "${EXITED_CONTAINERS[*]}"
+                  docker rm "${EXITED_CONTAINERS[@]}"
+                  echo 'OK: contenedores Exited eliminados.'
+                else
+                  echo 'No existen contenedores en estado Exited.'
+                fi
+
+                # Si por algún estado especial el contenedor sigue existiendo,
+                # se elimina explícitamente para garantizar que el nombre quede libre.
+                if docker ps -a --format '{{.Names}}' | grep -Fxq "${CONTAINER_NAME}"; then
+                  echo "El contenedor ${CONTAINER_NAME} todavía existe. Eliminando..."
+                  docker rm -f "${CONTAINER_NAME}"
+                fi
+
+                # ----------------------------------------------------------
+                # 3. VALIDAR NOMBRE Y PUERTO ANTES DEL NUEVO DOCKER RUN
+                # ----------------------------------------------------------
+                if docker ps -a --format '{{.Names}}' | grep -Fxq "${CONTAINER_NAME}"; then
+                  echo "ERROR: el nombre ${CONTAINER_NAME} continúa ocupado."
+                  docker ps -a --filter "name=^/${CONTAINER_NAME}$"
+                  exit 1
+                fi
+
+                if ss -lnt | awk '{print $4}' | grep -Eq "(^|:)${HOST_PORT}$"; then
+                  echo "ERROR: TCP/${HOST_PORT} continúa ocupado."
+                  ss -lntp | grep ":${HOST_PORT}" || true
+                  exit 1
+                fi
+
+                echo "OK: nombre ${CONTAINER_NAME} y TCP/${HOST_PORT} disponibles."
+
+                # ----------------------------------------------------------
+                # ROLLBACK AUTOMÁTICO
+                # ----------------------------------------------------------
+                rollback_previous_image() {
+                  echo
+                  echo '------------------------------------------------------------'
+                  echo ' ROLLBACK AUTOMÁTICO'
+                  echo '------------------------------------------------------------'
+
+                  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+
+                  if [[ -z "${OLD_IMAGE_ID}" ]]; then
+                    echo 'No existe una imagen anterior disponible para rollback.'
+                    return 1
+                  fi
+
+                  echo "Restaurando imagen anterior: ${OLD_IMAGE_ID}"
+
+                  if ! docker run -d \
+                    --name "${CONTAINER_NAME}" \
+                    --restart "${DOCKER_RESTART_POLICY}" \
+                    -p "${HOST_PORT}:${CONTAINER_PORT}" \
+                    "${OLD_IMAGE_ID}"; then
+                    echo 'ERROR: no fue posible restaurar el contenedor anterior.'
+                    return 1
+                  fi
+
+                  for ROLLBACK_ATTEMPT in $(seq 1 "${ROLLBACK_HEALTH_CHECK_RETRIES}"); do
+                    if curl --fail --silent "${HEALTHCHECK_URL}" >/dev/null 2>&1; then
+                      echo 'OK: rollback completado; la versión anterior volvió a responder por HTTP.'
+                      return 0
+                    fi
+
+                    echo "Esperando rollback HTTP... intento ${ROLLBACK_ATTEMPT}/${ROLLBACK_HEALTH_CHECK_RETRIES}"
+                    sleep "${ROLLBACK_HEALTH_CHECK_INTERVAL_SECONDS}"
+                  done
+
+                  echo 'ERROR: la imagen anterior fue iniciada, pero no respondió por HTTP.'
+                  docker logs \
+                    --tail "${DOCKER_LOG_TAIL_LINES}" \
+                    "${CONTAINER_NAME}" || true
+
+                  return 1
+                }
+
+                echo
+                echo '============================================================'
+                echo ' [6/7] EJECUTANDO CONTENEDOR'
+                echo '============================================================'
+                echo
+
+                if ! docker run -d \
+                  --name "${CONTAINER_NAME}" \
+                  --restart "${DOCKER_RESTART_POLICY}" \
+                  -p "${HOST_PORT}:${CONTAINER_PORT}" \
+                  "${IMAGE}"; then
+
+                  echo 'ERROR: no fue posible iniciar el nuevo contenedor.'
+                  rollback_previous_image || true
+                  exit 1
+                fi
+
+                HTTP_OK='false'
+
+                for ATTEMPT in $(seq 1 "${HEALTH_CHECK_RETRIES}"); do
+                  # Si el contenedor murió, no esperamos todos los intentos HTTP.
+                  if ! docker inspect \
+                    --format '{{.State.Running}}' \
+                    "${CONTAINER_NAME}" 2>/dev/null \
+                    | grep -Fxq 'true'; then
+
+                    echo 'El contenedor dejó de ejecutarse durante el health check.'
+                    break
+                  fi
+
+                  if curl \
+                    --fail \
+                    --silent \
+                    --show-error \
+                    "${HEALTHCHECK_URL}" >/dev/null 2>&1; then
+
+                    HTTP_OK='true'
+                    break
+                  fi
+
+                  echo "Esperando HTTP... intento ${ATTEMPT}/${HEALTH_CHECK_RETRIES}"
+                  sleep "${HEALTH_CHECK_INTERVAL_SECONDS}"
+                done
+
+                echo
+                echo '============================================================'
+                echo ' [7/7] VALIDACIÓN FINAL'
+                echo '============================================================'
+                echo
+
+                RUNNING=$(docker inspect \
+                  "${CONTAINER_NAME}" \
+                  --format '{{.State.Running}}' 2>/dev/null || echo 'false')
+
+                if [[ "${RUNNING}" != 'true' ]]; then
+                  echo 'ERROR: El contenedor nuevo no quedó en ejecución.'
+                  docker logs \
+                    --tail "${DOCKER_LOG_TAIL_LINES}" \
+                    "${CONTAINER_NAME}" || true
+
+                  rollback_previous_image || true
+                  exit 1
+                fi
+
+                if [[ "${HTTP_OK}" != 'true' ]]; then
+                  echo 'ERROR: El contenedor está activo, pero la aplicación no respondió por HTTP.'
+                  docker logs \
+                    --tail "${DOCKER_LOG_TAIL_LINES}" \
+                    "${CONTAINER_NAME}" || true
+
+                  rollback_previous_image || true
+                  exit 1
+                fi
+
+                docker ps --filter "name=^/${CONTAINER_NAME}$"
+
+                echo
+                echo 'Imagen utilizada:'
+                docker inspect \
+                  "${CONTAINER_NAME}" \
+                  --format '{{.Config.Image}}'
+
+                echo
+                echo 'Mapeo de puertos:'
+                docker port "${CONTAINER_NAME}"
+
+                echo
+                echo 'Respuesta HTTP local:'
+                curl \
+                  --fail \
+                  --show-error \
+                  --silent \
+                  "${HEALTHCHECK_URL}" \
+                  | head -n "${HTTP_RESPONSE_PREVIEW_LINES}"
+
+                echo
+                echo '============================================================'
+                echo ' DEPLOY FINALIZADO CORRECTAMENTE'
+                echo '============================================================'
+                echo
+
+            env:
+              RESOURCE_GROUP_NAME: $(resourceGroupName)
+              ACR_NAME: $(acrName)
+              ACR_LOGIN_SERVER: $(acrLoginServer)
+              IMAGE_REPOSITORY: $(imageRepository)
+              IMAGE_TAG: $(imageTag)
+              CONTAINER_NAME: $(containerName)
+              HOST_PORT: $(hostPort)
+              CONTAINER_PORT: $(containerPort)
