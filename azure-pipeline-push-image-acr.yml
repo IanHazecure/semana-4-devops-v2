@@ -1,57 +1,96 @@
-import { useEffect, useState } from 'react'
+trigger:
+  branches:
+    include:
+      - main
 
-const PASOS = [
-  'GitHub',
-  'Azure Pipelines (build)',
-  'Azure Container Registry',
-  'Azure Pipelines (deploy)',
-  'VM con Docker',
-]
+pr: none
 
-export default function App() {
-  const [cfg, setCfg] = useState(null)
-  const [fallo, setFallo] = useState(false)
-  const [clics, setClics] = useState(0)
-  const [hora] = useState(() => new Date().toLocaleTimeString('es-CL'))
+pool:
+  vmImage: 'ubuntu-latest'
 
-  // config.json lo genera Nginx al iniciar el contenedor (APP_ENV y APP_VERSION)
-  useEffect(() => {
-    fetch('/config.json', { cache: 'no-store' })
-      .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
-      .then(setCfg)
-      .catch(() => setFallo(true))
-  }, [])
+steps:
 
-  const entorno = cfg?.environment ?? '...'
-  const datos = [
-    ['Entorno', entorno],
-    ['Versión de la imagen', cfg?.version ?? '...'],
-    ['Servidor', window.location.host],
-    ['Página cargada a las', hora],
-  ]
+- checkout: self
+  clean: true
 
-  return (
-    <main className="wrap">
-      <header>
-        <span className={`badge env-${entorno}`}>{entorno.toUpperCase()}</span>
-        <h1>Semana 6 · React en Nginx</h1>
-        <p>Compilada con Vite dentro de Docker y desplegada con Azure Pipelines.</p>
-      </header>
+# CI 1/3: construir la imagen (el Dockerfile compila la app de React con Vite)
+- task: Docker@2
+  displayName: 'Build de imagen (React + Nginx)'
+  inputs:
+    command: 'build'
+    containerRegistry: '$(dockerRegistryServiceConnection)'
+    repository: '$(imageRepository)'
+    Dockerfile: '$(Build.SourcesDirectory)/docker/Dockerfile'
+    buildContext: '$(Build.SourcesDirectory)/docker'
+    tags: |
+      $(Build.BuildId)
+      latest
 
-      {fallo && <p className="aviso">No se pudo leer /config.json</p>}
+# CI 2/3: prueba de humo. Si falla, la imagen NO se publica en ACR.
+- bash: |
+    set -Eeuo pipefail
 
-      <section className="grid">
-        {datos.map(([k, v]) => (
-          <div className="card" key={k}>
-            <small>{k}</small>
-            <strong>{v}</strong>
-          </div>
-        ))}
-      </section>
+    IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' \
+      | grep -F '/$(imageRepository):' \
+      | grep -E ':$(Build.BuildId)$' \
+      | head -n 1)
 
-      <p className="flow">{PASOS.join('  →  ')}</p>
+    if [ -z "${IMAGE}" ]; then
+      echo 'ERROR: no se encontró la imagen construida.'
+      docker images
+      exit 1
+    fi
+    echo "Imagen bajo prueba: ${IMAGE}"
 
-      <button onClick={() => setClics(clics + 1)}>Clics: {clics}</button>
-    </main>
-  )
-}
+    cleanup() {
+      docker logs ci-smoke 2>&1 | tail -n 30 || true
+      docker rm -f ci-smoke >/dev/null 2>&1 || true
+    }
+    trap cleanup EXIT
+
+    docker run -d --name ci-smoke \
+      -e APP_ENV=ci -e APP_VERSION=build-$(Build.BuildId) \
+      -p 8081:80 "${IMAGE}"
+
+    OK='false'
+    for i in {1..15}; do
+      if curl -fsS http://127.0.0.1:8081/ >/dev/null 2>&1; then OK='true'; break; fi
+      echo "Esperando HTTP... intento ${i}/15"
+      sleep 2
+    done
+    [ "${OK}" = 'true' ] || { echo 'ERROR: el contenedor no respondió por HTTP.'; exit 1; }
+
+    echo 'Comprobando que la página de React esté publicada...'
+    curl -fsS http://127.0.0.1:8081/ | grep -q 'id="root"'
+
+    echo 'Comprobando la configuración en tiempo de ejecución...'
+    curl -fsS http://127.0.0.1:8081/config.json
+    echo
+    curl -fsS http://127.0.0.1:8081/config.json | grep -q '"ci"'
+
+    echo 'Comprobando que una ruta de la SPA devuelva index.html...'
+    curl -fsS http://127.0.0.1:8081/ruta/que/no/existe | grep -q 'id="root"'
+
+    echo 'OK: prueba de humo superada.'
+  displayName: 'Prueba de humo del contenedor (CI)'
+
+# CI 3/3: publicar la imagen en Azure Container Registry
+- task: Docker@2
+  displayName: 'Push de imagen a ACR'
+  inputs:
+    command: 'push'
+    containerRegistry: '$(dockerRegistryServiceConnection)'
+    repository: '$(imageRepository)'
+    tags: |
+      $(Build.BuildId)
+      latest
+
+- bash: |
+    echo '============================================================'
+    echo ' BUILD, PRUEBA Y PUSH FINALIZADOS CORRECTAMENTE'
+    echo '============================================================'
+    echo "Repositorio : $(imageRepository)"
+    echo "Build ID    : $(Build.BuildId)"
+    echo "Tags        : $(Build.BuildId), latest"
+    echo '============================================================'
+  displayName: 'Resumen de imagen publicada'
