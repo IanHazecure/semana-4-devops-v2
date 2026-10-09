@@ -30,8 +30,10 @@ async function connectDb() {
   }
 }
 
-// El servidor  MySQL
-//  /api/health respond
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', database: dbReady ? 'ready' : 'unavailable' });
+});
+
 connectDb();
 
 app.use('/api/personas', (req, res, next) => {
