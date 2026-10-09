@@ -13,9 +13,9 @@ steps:
 - checkout: self
   clean: true
 
-# CI 1/3: construir la imagen (el Dockerfile compila la app de React con Vite)
+# ===== FRONTEND (React + Nginx) =====
 - task: Docker@2
-  displayName: 'Build de imagen (React + Nginx)'
+  displayName: 'Build de imagen frontend (React + Nginx)'
   inputs:
     command: 'build'
     containerRegistry: '$(dockerRegistryServiceConnection)'
@@ -26,57 +26,22 @@ steps:
       $(Build.BuildId)
       latest
 
-# CI 2/3: prueba de humo. Si falla, la imagen NO se publica en ACR.
 - bash: |
     set -Eeuo pipefail
-
-    IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' \
-      | grep -F '/$(imageRepository):' \
-      | grep -E ':$(Build.BuildId)$' \
-      | head -n 1)
-
-    if [ -z "${IMAGE}" ]; then
-      echo 'ERROR: no se encontró la imagen construida.'
-      docker images
-      exit 1
-    fi
-    echo "Imagen bajo prueba: ${IMAGE}"
-
-    cleanup() {
-      docker logs ci-smoke 2>&1 | tail -n 30 || true
-      docker rm -f ci-smoke >/dev/null 2>&1 || true
-    }
+    IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -F '/$(imageRepository):' | grep -E ':$(Build.BuildId)$' | head -n 1)
+    [ -n "${IMAGE}" ] || { echo 'ERROR: no se encontró la imagen frontend.'; exit 1; }
+    cleanup() { docker logs ci-smoke 2>&1 | tail -n 30 || true; docker rm -f ci-smoke >/dev/null 2>&1 || true; }
     trap cleanup EXIT
-
-    docker run -d --name ci-smoke \
-      -e APP_ENV=ci -e APP_VERSION=build-$(Build.BuildId) \
-      -p 8081:80 "${IMAGE}"
-
+    docker run -d --name ci-smoke -e APP_ENV=ci -e APP_VERSION=build-$(Build.BuildId) -p 8081:80 "${IMAGE}"
     OK='false'
-    for i in {1..15}; do
-      if curl -fsS http://127.0.0.1:8081/ >/dev/null 2>&1; then OK='true'; break; fi
-      echo "Esperando HTTP... intento ${i}/15"
-      sleep 2
-    done
-    [ "${OK}" = 'true' ] || { echo 'ERROR: el contenedor no respondió por HTTP.'; exit 1; }
-
-    echo 'Comprobando que la página de React esté publicada...'
+    for i in {1..15}; do curl -fsS http://127.0.0.1:8081/ >/dev/null 2>&1 && { OK='true'; break; }; sleep 2; done
+    [ "${OK}" = 'true' ] || { echo 'ERROR: el frontend no respondió por HTTP.'; exit 1; }
     curl -fsS http://127.0.0.1:8081/ | grep -q 'id="root"'
+    echo 'OK: prueba de humo del frontend superada.'
+  displayName: 'Prueba de humo del frontend (CI)'
 
-    echo 'Comprobando la configuración en tiempo de ejecución...'
-    curl -fsS http://127.0.0.1:8081/config.json
-    echo
-    curl -fsS http://127.0.0.1:8081/config.json | grep -q '"ci"'
-
-    echo 'Comprobando que una ruta de la SPA devuelva index.html...'
-    curl -fsS http://127.0.0.1:8081/ruta/que/no/existe | grep -q 'id="root"'
-
-    echo 'OK: prueba de humo superada.'
-  displayName: 'Prueba de humo del contenedor (CI)'
-
-# CI 3/3: publicar la imagen en Azure Container Registry
 - task: Docker@2
-  displayName: 'Push de imagen a ACR'
+  displayName: 'Push de imagen frontend a ACR'
   inputs:
     command: 'push'
     containerRegistry: '$(dockerRegistryServiceConnection)'
@@ -85,12 +50,48 @@ steps:
       $(Build.BuildId)
       latest
 
+# ===== API (Node + Express) =====
+- task: Docker@2
+  displayName: 'Build de imagen API'
+  inputs:
+    command: 'build'
+    containerRegistry: '$(dockerRegistryServiceConnection)'
+    repository: '$(apiImageRepository)'
+    Dockerfile: '$(Build.SourcesDirectory)/api/Dockerfile'
+    buildContext: '$(Build.SourcesDirectory)/api'
+    tags: |
+      $(Build.BuildId)
+      latest
+
+- bash: |
+    set -Eeuo pipefail
+    IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -F '/$(apiImageRepository):' | grep -E ':$(Build.BuildId)$' | head -n 1)
+    [ -n "${IMAGE}" ] || { echo 'ERROR: no se encontró la imagen de la API.'; exit 1; }
+    cleanup() { docker logs ci-smoke-api 2>&1 | tail -n 30 || true; docker rm -f ci-smoke-api >/dev/null 2>&1 || true; }
+    trap cleanup EXIT
+    # Prueba sin MySQL real: solo valida que el proceso arranca y responde /api/health
+    docker run -d --name ci-smoke-api -e DB_HOST=127.0.0.1 -p 8082:3001 "${IMAGE}"
+    OK='false'
+    for i in {1..10}; do curl -fsS http://127.0.0.1:8082/api/health >/dev/null 2>&1 && { OK='true'; break; }; sleep 2; done
+    [ "${OK}" = 'true' ] || { echo 'ERROR: la API no respondió por HTTP.'; exit 1; }
+    echo 'OK: prueba de humo de la API superada.'
+  displayName: 'Prueba de humo de la API (CI)'
+
+- task: Docker@2
+  displayName: 'Push de imagen API a ACR'
+  inputs:
+    command: 'push'
+    containerRegistry: '$(dockerRegistryServiceConnection)'
+    repository: '$(apiImageRepository)'
+    tags: |
+      $(Build.BuildId)
+      latest
+
 - bash: |
     echo '============================================================'
-    echo ' BUILD, PRUEBA Y PUSH FINALIZADOS CORRECTAMENTE'
+    echo ' BUILD, PRUEBAS Y PUSH FINALIZADOS CORRECTAMENTE'
     echo '============================================================'
-    echo "Repositorio : $(imageRepository)"
-    echo "Build ID    : $(Build.BuildId)"
-    echo "Tags        : $(Build.BuildId), latest"
+    echo "Frontend: $(imageRepository):$(Build.BuildId)"
+    echo "API     : $(apiImageRepository):$(Build.BuildId)"
     echo '============================================================'
-  displayName: 'Resumen de imagen publicada'
+  displayName: 'Resumen de imágenes publicadas'

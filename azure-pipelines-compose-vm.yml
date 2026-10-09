@@ -1,0 +1,266 @@
+# No ejecutar directamente por cambios en este repositorio.
+trigger: none
+pr: none
+
+# Se dispara cuando termina bien el pipeline de build (ajusta el "source" al nombre real de tu pipeline de build).
+resources:
+  pipelines:
+  - pipeline: containerBuild
+    source: IanHazecure.semana-4-devops-v2
+    trigger:
+      branches:
+        include:
+        - main
+
+parameters:
+- name: targets
+  type: object
+  default:
+  - name: Dev
+    label: 'Desarrollo (dev)'
+    dependsOn: Bootstrap
+    appEnv: 'dev'
+    projectName: 'app-dev'
+    hostPort: '8080'
+  - name: Prod
+    label: 'Producción (prod)'
+    dependsOn: Deploy_Dev
+    appEnv: 'prod'
+    projectName: 'app-prod'
+    hostPort: '$(hostPort)'
+
+stages:
+
+# ============================================================
+# STAGE 0 - VALIDACIÓN DE VARIABLES
+# ============================================================
+- stage: ValidateVariables
+  displayName: 'Validar variables del pipeline'
+  jobs:
+  - job: ValidateVariables
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: none
+    - bash: |
+        set -Eeuo pipefail
+        REQUIRED=(azureServiceConnection environmentName resourceGroupName virtualMachineName \
+          acrName acrLoginServer imageRepository apiImageRepository hostPort vmUser)
+        MISSING=0
+        for v in "${REQUIRED[@]}"; do
+          val="${!v:-}"
+          if [ -z "$val" ]; then echo "ERROR: falta la variable '$v'"; MISSING=1; else echo "OK: $v"; fi
+        done
+        [ "$MISSING" = 0 ] || exit 1
+      displayName: 'Comprobar configuración requerida'
+      env:
+        azureServiceConnection: $(azureServiceConnection)
+        environmentName: $(environmentName)
+        resourceGroupName: $(resourceGroupName)
+        virtualMachineName: $(virtualMachineName)
+        acrName: $(acrName)
+        acrLoginServer: $(acrLoginServer)
+        imageRepository: $(imageRepository)
+        apiImageRepository: $(apiImageRepository)
+        hostPort: $(hostPort)
+        vmUser: $(vmUser)
+
+# ============================================================
+# STAGE 1 - BOOTSTRAP: instala Docker + plugin compose en la VM
+# ============================================================
+- stage: Bootstrap
+  displayName: 'Preparar VM para contenedores'
+  dependsOn: ValidateVariables
+  condition: succeeded()
+  jobs:
+  - job: PrepareVM
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: none
+    - task: AzureCLI@2
+      displayName: 'Bootstrap automatizado de la VM'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -Eeuo pipefail
+          echo '[1/2] Validando máquina virtual'
+          az vm show -g "$(resourceGroupName)" -n "$(virtualMachineName)" -o table
+
+          STATE=$(az vm get-instance-view -g "$(resourceGroupName)" -n "$(virtualMachineName)" \
+            --query "instanceView.statuses[?starts_with(code,'PowerState/')].code" -o tsv)
+          echo "Estado actual: ${STATE}"
+          if [ "${STATE}" != "PowerState/running" ]; then
+            echo "La VM no está en ejecución. Iniciando..."
+            az vm start -g "$(resourceGroupName)" -n "$(virtualMachineName)"
+          fi
+
+          echo '[2/2] Instalando Docker y el plugin compose (si falta)'
+          az vm run-command invoke \
+            -g "$(resourceGroupName)" -n "$(virtualMachineName)" \
+            --command-id RunShellScript \
+            --scripts '
+              set -e
+              if ! command -v docker >/dev/null 2>&1; then
+                curl -fsSL https://get.docker.com | sh
+              fi
+              if ! docker compose version >/dev/null 2>&1; then
+                apt-get update -y && apt-get install -y docker-compose-plugin
+              fi
+              usermod -aG docker $(vmUser) || true
+              systemctl enable docker && systemctl start docker
+              docker --version
+              docker compose version
+            '
+
+# ============================================================
+# STAGE 2 - DEPLOY (uno por cada entorno de "targets": Dev y Prod)
+# ============================================================
+- ${{ each targetEnv in parameters.targets }}:
+  - stage: Deploy_${{ targetEnv.name }}
+    displayName: 'Desplegar en ${{ targetEnv.label }}'
+    dependsOn: ${{ targetEnv.dependsOn }}
+    condition: succeeded()
+    jobs:
+    - deployment: DeployCompose
+      displayName: 'Desplegar con docker compose'
+      timeoutInMinutes: 20
+      environment:
+        name: '$(environmentName)'
+        resourceType: VirtualMachine
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: none
+
+            - task: AzureCLI@2
+              displayName: 'Generar compose y desplegar'
+              inputs:
+                azureSubscription: '$(azureServiceConnection)'
+                scriptType: 'bash'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+                  set -Eeuo pipefail
+
+                  # Este paso corre EN LA VM, porque el environment es de tipo VirtualMachine
+                  # y la VM tiene el agente de Azure Pipelines registrado (igual que en el
+                  # pipeline anterior). Por eso se puede escribir archivos y correr docker
+                  # directamente, sin az vm run-command.
+
+                  PROJECT_NAME="${{ targetEnv.projectName }}"
+                  APP_ENV="${{ targetEnv.appEnv }}"
+                  HOST_PORT="${{ targetEnv.hostPort }}"
+                  WORKDIR="/opt/${PROJECT_NAME}"
+                  IMAGE_TAG="$(resources.pipeline.containerBuild.runID)"
+
+                  echo "Entorno destino: ${{ targetEnv.label }} (APP_ENV=${APP_ENV}, puerto host=${HOST_PORT})"
+
+                  echo '[1/5] Validando acceso a Docker en la VM'
+                  if ! id -nG | grep -qw "docker"; then
+                    echo "ERROR: $(vmUser) no pertenece al grupo docker. Revisa el Bootstrap."
+                    exit 1
+                  fi
+                  docker --version
+                  docker compose version
+
+                  echo '[2/5] Escribiendo docker-compose.yml, init.sql y .env en la VM'
+                  sudo mkdir -p "${WORKDIR}/db"
+                  sudo chown -R "$(whoami)" "${WORKDIR}"
+
+                  cat > "${WORKDIR}/db/init.sql" <<'SQLEOF'
+                  CREATE DATABASE IF NOT EXISTS my_database;
+                  USE my_database;
+                  CREATE TABLE IF NOT EXISTS tasks (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    title VARCHAR(255) NOT NULL,
+                    done BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                  );
+                  INSERT INTO tasks (title, done) VALUES
+                    ('Configurar MySQL', TRUE),
+                    ('Crear API', TRUE),
+                    ('Conectar React', FALSE);
+                  SQLEOF
+
+                  cat > "${WORKDIR}/docker-compose.yml" <<'YMLEOF'
+                  services:
+                    db:
+                      image: mysql:8.0
+                      restart: unless-stopped
+                      environment:
+                        MYSQL_ROOT_PASSWORD: Password123
+                        MYSQL_DATABASE: my_database
+                        MYSQL_USER: mysqluser
+                        MYSQL_PASSWORD: Password123
+                      volumes:
+                        - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+                        - db_data:/var/lib/mysql
+                      healthcheck:
+                        test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pPassword123"]
+                        interval: 10s
+                        timeout: 5s
+                        retries: 10
+                    api:
+                      image: ${ACR_LOGIN_SERVER}/${API_IMAGE_REPO}:${IMAGE_TAG}
+                      restart: unless-stopped
+                      environment:
+                        DB_HOST: db
+                        DB_USER: mysqluser
+                        DB_PASSWORD: Password123
+                        DB_NAME: my_database
+                      depends_on:
+                        db:
+                          condition: service_healthy
+                    frontend:
+                      image: ${ACR_LOGIN_SERVER}/${FRONTEND_IMAGE_REPO}:${IMAGE_TAG}
+                      restart: unless-stopped
+                      ports:
+                        - "${HOST_PORT}:80"
+                      environment:
+                        APP_ENV: ${APP_ENV}
+                        APP_VERSION: ${IMAGE_TAG}
+                      depends_on:
+                        - api
+                  volumes:
+                    db_data:
+                  YMLEOF
+
+                  cat > "${WORKDIR}/.env" <<ENVEOF
+                  ACR_LOGIN_SERVER=$(acrLoginServer)
+                  FRONTEND_IMAGE_REPO=$(imageRepository)
+                  API_IMAGE_REPO=$(apiImageRepository)
+                  IMAGE_TAG=${IMAGE_TAG}
+                  APP_ENV=${APP_ENV}
+                  HOST_PORT=${HOST_PORT}
+                  ENVEOF
+
+                  echo '[3/5] Iniciando sesión en ACR'
+                  ACR_USERNAME=$(az acr credential show --name "$(acrName)" --query username -o tsv)
+                  ACR_PASSWORD=$(az acr credential show --name "$(acrName)" --query "passwords[0].value" -o tsv)
+                  echo "${ACR_PASSWORD}" | docker login "$(acrLoginServer)" -u "${ACR_USERNAME}" --password-stdin
+
+                  echo '[4/5] docker compose pull + up -d'
+                  cd "${WORKDIR}"
+                  docker compose --project-name "${PROJECT_NAME}" pull
+                  docker compose --project-name "${PROJECT_NAME}" up -d
+                  docker logout "$(acrLoginServer)"
+
+                  echo '[5/5] Verificando salud'
+                  OK='false'
+                  for i in $(seq 1 15); do
+                    if curl -fsS "http://127.0.0.1:${HOST_PORT}/" >/dev/null 2>&1; then OK='true'; break; fi
+                    sleep 2
+                  done
+                  if [ "${OK}" != 'true' ]; then
+                    echo "ERROR: el frontend no respondió en el puerto ${HOST_PORT}."
+                    docker compose --project-name "${PROJECT_NAME}" logs --tail=50
+                    exit 1
+                  fi
+                  echo 'OK: frontend responde.'
+
+                  curl -fsS "http://127.0.0.1:${HOST_PORT}/api/health" \
+                    && echo 'OK: API responde (vía proxy del frontend).' \
+                    || echo 'AVISO: la API no respondió aún (puede seguir esperando a MySQL; revisa logs si persiste).'
