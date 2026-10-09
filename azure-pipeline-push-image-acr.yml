@@ -18,7 +18,7 @@ steps:
   displayName: 'Build de imagen frontend (React + Nginx)'
   inputs:
     command: 'build'
-    containerRegistry: '$(dockerRegistryServiceConnection)'
+    containerRegistry: 'sc-devops-v2'
     repository: '$(imageRepository)'
     Dockerfile: '$(Build.SourcesDirectory)/docker/Dockerfile'
     buildContext: '$(Build.SourcesDirectory)/docker'
@@ -44,7 +44,7 @@ steps:
   displayName: 'Push de imagen frontend a ACR'
   inputs:
     command: 'push'
-    containerRegistry: '$(dockerRegistryServiceConnection)'
+    containerRegistry: 'sc-devops-v2'
     repository: '$(imageRepository)'
     tags: |
       $(Build.BuildId)
@@ -55,7 +55,7 @@ steps:
   displayName: 'Build de imagen API'
   inputs:
     command: 'build'
-    containerRegistry: '$(dockerRegistryServiceConnection)'
+    containerRegistry: 'sc-devops-v2'
     repository: '$(apiImageRepository)'
     Dockerfile: '$(Build.SourcesDirectory)/api/Dockerfile'
     buildContext: '$(Build.SourcesDirectory)/api'
@@ -81,7 +81,7 @@ steps:
   displayName: 'Push de imagen API a ACR'
   inputs:
     command: 'push'
-    containerRegistry: '$(dockerRegistryServiceConnection)'
+    containerRegistry: 'sc-devops-v2'
     repository: '$(apiImageRepository)'
     tags: |
       $(Build.BuildId)
