@@ -36,7 +36,7 @@ steps:
     [ -n "${IMAGE}" ] || { echo 'ERROR: no se encontró la imagen frontend.'; exit 1; }
     cleanup() { docker logs ci-smoke 2>&1 | tail -n 30 || true; docker rm -f ci-smoke >/dev/null 2>&1 || true; }
     trap cleanup EXIT
-    docker run -d --name ci-smoke -e APP_ENV=ci -e APP_VERSION=build-$(Build.BuildId) -p 8081:80 "${IMAGE}"
+    docker run -d --name ci-smoke --add-host api:127.0.0.1 -e APP_ENV=ci -e APP_VERSION=build-$(Build.BuildId) -p 8081:80 "${IMAGE}"
     OK='false'
     for i in {1..15}; do curl -fsS http://127.0.0.1:8081/ >/dev/null 2>&1 && { OK='true'; break; }; sleep 2; done
     [ "${OK}" = 'true' ] || { echo 'ERROR: el frontend no respondió por HTTP.'; exit 1; }
