@@ -30,7 +30,7 @@ parameters:
     dependsOn: Deploy_Dev
     appEnv: 'prod'
     projectName: 'app-prod'
-    hostPort: '$(hostPort)'
+    hostPort: '80'
 
 stages:
 
