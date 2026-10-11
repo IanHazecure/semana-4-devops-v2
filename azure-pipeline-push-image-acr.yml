@@ -9,7 +9,7 @@ pool:
   vmImage: 'ubuntu-latest'
 
 variables:
-  imageRepository: 'frontend'
+  imageRepository: 'semana4-nginx'
   apiImageRepository: 'api'
 
 steps:
