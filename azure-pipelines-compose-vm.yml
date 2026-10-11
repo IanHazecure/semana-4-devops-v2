@@ -176,16 +176,16 @@ stages:
                   cat > "${WORKDIR}/db/init.sql" <<'SQLEOF'
                   CREATE DATABASE IF NOT EXISTS my_database;
                   USE my_database;
-                  CREATE TABLE IF NOT EXISTS tasks (
+                  CREATE TABLE IF NOT EXISTS personas (
                     id INT AUTO_INCREMENT PRIMARY KEY,
-                    title VARCHAR(255) NOT NULL,
-                    done BOOLEAN DEFAULT FALSE,
+                    nombre VARCHAR(255) NOT NULL,
+                    rut VARCHAR(12) NOT NULL UNIQUE,
+                    fecha_nacimiento DATE NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                   );
-                  INSERT INTO tasks (title, done) VALUES
-                    ('Configurar MySQL', TRUE),
-                    ('Crear API', TRUE),
-                    ('Conectar React', FALSE);
+                  INSERT IGNORE INTO personas (nombre, rut, fecha_nacimiento) VALUES
+                    ('Felipe Ruz', '19961817-2', '1998-12-30'),
+                    ('Valentina Navarro', '21305556-9', '2003-05-27');
                   SQLEOF
 
                   cat > "${WORKDIR}/docker-compose.yml" <<'YMLEOF'
@@ -258,7 +258,12 @@ stages:
                   done
 
                   docker compose --project-name "${PROJECT_NAME}" pull
-                  docker compose --project-name "${PROJECT_NAME}" up -d
+                  docker compose --project-name "${PROJECT_NAME}" up -d --wait
+
+                  echo 'Aplicando esquema y datos de personas en MySQL'
+                  docker compose --project-name "${PROJECT_NAME}" exec -T db \
+                    mysql -uroot -pPassword123 < "${WORKDIR}/db/init.sql"
+                  docker compose --project-name "${PROJECT_NAME}" restart api
                   docker logout "$(acrLoginServer)"
 
                   echo '[5/5] Verificando salud'
