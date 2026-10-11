@@ -247,6 +247,16 @@ stages:
 
                   echo '[4/5] docker compose pull + up -d'
                   cd "${WORKDIR}"
+
+                  # Retira los contenedores del despliegue standalone anterior,
+                  # que pueden conservar los puertos 80 y 8080.
+                  for LEGACY_CONTAINER in webapp-nginx webapp-nginx-dev; do
+                    if docker ps -a --format '{{.Names}}' | grep -Fxq "${LEGACY_CONTAINER}"; then
+                      echo "Eliminando contenedor legacy: ${LEGACY_CONTAINER}"
+                      docker rm -f "${LEGACY_CONTAINER}"
+                    fi
+                  done
+
                   docker compose --project-name "${PROJECT_NAME}" pull
                   docker compose --project-name "${PROJECT_NAME}" up -d
                   docker logout "$(acrLoginServer)"
